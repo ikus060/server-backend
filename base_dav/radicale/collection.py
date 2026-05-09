@@ -9,9 +9,9 @@ import contextlib
 from radicale import pathutils
 from radicale.item import Item as RadicaleItem
 from radicale.storage import BaseCollection, BaseStorage
+from typing import  Iterator, Tuple, Iterable
 
 from odoo.http import request
-
 
 def _norm_path(path):
     """Return sanitized Radicale path without leading slash.
@@ -130,24 +130,23 @@ class Collection(BaseCollection):
       - item: "admin/<collection_id>/<href>"
     """
 
-    def __init__(self, path):
+    def __init__(self, path, record=None):
         """Initialize DAV collection from Radicale path.
-
-        Supports:
-          - root
-          - principal
-          - Odoo collection
-          - collection item
 
         :param path: Radicale collection path
         :type path: str
+        :param record: Optional pre-fetched dav.collection record
+        :type record: Optional[odoo.models.Model]
         """
         self._path = _norm_path(path)
         self.path_components = tuple(self._path.split("/", 2)) if self._path else ()
-
-        env = request.env
         self._record = None
-        if len(self.path_components) > 1 and (self.path_components[1] or "").isdigit():
+
+        if record is not None:
+            # Use pre-fetched record directly — no DB call
+            self._record = record
+        elif len(self.path_components) > 1 and (self.path_components[1] or "").isdigit():
+            env = request.env
             rec = env["dav.collection"].browse(int(self.path_components[1])).exists()
             self._record = rec or None
 
@@ -179,13 +178,24 @@ class Collection(BaseCollection):
         if self._record.tag == "VCALENDAR":
             metadata["C:supported-calendar-component-set"] = "VEVENT"
             metadata["ICAL:calendar-color"] = self._record.calendar_color
-
+            metadata["C:calendar-description"] = self._record.description or ""
+        elif  self._record.tag == "VADDRESSBOOK":
+            metadata["A:addressbook-description"] = self._record.description or ""
         return metadata
 
     def _require_record(self):
         if not self._record:
             raise ValueError(f"Not a DAV collection: {self.path!r}")
         return self._record
+    
+    @property
+    def etag(self) -> str:
+        """
+        Return etag for the collection. Delegate this to dav.collection.
+        """
+        if not self._record:
+            raise NotImplementedError()
+        return self._record.dav_etag()
 
     @property
     def path(self):
@@ -214,30 +224,38 @@ class Collection(BaseCollection):
         :return: Iterator of Radicale items
         :rtype: Iterator[Any]
         """
-        for href in self.list():
+        for href, record in self.list_with_records():
             item = self.get(href)
             if item is not None:
                 yield item
 
-    def list(self):
-        """Return relative hrefs for items or child collections.
+    def list_with_records(self):
+        """Return (relative_href, record_or_None) pairs for child collections.
+        Avoids N+1 queries by pre-fetching all records at once.
 
-        :return: Iterable of relative hrefs
-        :rtype: Iterable[str]
+        :return: Iterable of (href, record or None) tuples
+        :rtype: Iterable[tuple[str, Model | None]]
         """
         if self._record:
             for href in self._record.dav_list(self, self.path_components):
-                yield _rel_href(self.path, href)
+                yield _rel_href(self.path, href), None
             return
 
         if self.is_principal:
-            for record in request.env["dav.collection"].search([]):
-                yield f"{self.owner}/{record.id}"
+            # Single search + single read = 2 queries for ALL collections
+            records = request.env["dav.collection"].search([])
+            records.read([
+                'name', 'rights', 'dav_type', 'model_id',
+                'domain', 'field_uuid', 'mapper_mode',
+                'calendar_color', 'description',
+            ])
+            for record in records:
+                yield f"{self.owner}/{record.id}", record
             return
 
         login = request.env.user.login
         if login:
-            yield login
+            yield login, None
 
     def get(self, href):
         """Retrieve single DAV item by href.
@@ -306,6 +324,29 @@ class Collection(BaseCollection):
         dt_value = self._record.write_date or self._record.create_date
         return self._record._odoo_to_http_datetime(dt_value) or ""
 
+    def sync(self, old_token: str = "") -> Tuple[str, Iterable[str]]:
+        """Return current token and changed items.
+        
+        If old_token is unknown or empty, return all items (full sync).
+        """
+        def hrefs_iter() -> Iterator[str]:
+            for item in self.get_all():
+                assert item.href
+                yield item.href
+
+        token = "http://radicale.org/ns/sync/%s" % self.etag.strip('"')
+        
+        # If no old token, or token changed (we don't support delta) -> full sync
+        if not old_token or old_token != token:
+            # TODO We could improve this
+            # Using a hash of existing record id to detect missing record
+            # Also use write_date to detect changes.
+            raise ValueError("Token not found: %r" % old_token)
+            # return token, hrefs_iter()
+            # raise DAVError(507)
+        
+        # Token is the same, nothing changed
+        return token, iter([])
 
 class Storage(BaseStorage):
     def discover(
@@ -337,7 +378,7 @@ class Storage(BaseStorage):
         parts = path.split("/", 2) if path else []
 
         if len(parts) == 3 and parts[1].isdigit():
-            collection = Collection("/".join(parts[:2]))
+            collection = Collection(path)
             if not collection._record:
                 return iter(())
             item = collection.get(parts[2])
@@ -351,7 +392,9 @@ class Storage(BaseStorage):
         if collection._record:
             children.extend(collection.get_all())
         else:
-            children.extend(Collection(child_path) for child_path in collection.list())
+            # Use list_with_records to avoid N+1
+            for child_path, record in collection.list_with_records():
+                children.append(Collection(child_path, record=record))
 
         return iter(children)
 

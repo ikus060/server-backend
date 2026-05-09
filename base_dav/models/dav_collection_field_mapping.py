@@ -8,7 +8,6 @@ import datetime
 
 import vobject
 from dateutil import tz
-
 from odoo import api, fields, models, tools
 from odoo.tools import safe_eval as safe_eval_mod
 

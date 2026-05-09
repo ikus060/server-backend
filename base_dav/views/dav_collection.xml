@@ -16,20 +16,24 @@
             <form>
                 <group>
                     <field name="name" />
-                    <field name="dav_type" />
+                    <field name="description" />
+                    <field name="calendar_color" invisible="dav_type != 'calendar'" />
                     <field name="url" widget="url" invisible="not url" />
                 </group>
                 <group string="Access">
-                    <field name="model_id" />
+                    <field name="rights" />
+                 </group>
+                <group string="Mapping">
+                    <field name="mapper_mode" />
+                    <field name="dav_type" invisible="mapper_mode != 'custom'"/>
+                    <field name="model_id" invisible="mapper_mode != 'custom'"/>
                     <field name="model_name" invisible="1" />
+                    <field name="field_uuid" domain="[('model_id', '=', model_id)]" invisible="mapper_mode != 'custom'"/>
                     <field
                         name="domain"
                         widget="domain"
                         options="{'model': 'model_name'}"
                     />
-                    <field name="field_uuid" domain="[('model_id', '=', model_id)]" />
-                    <field name="rights" />
-                    <field name="calendar_color" invisible="dav_type != 'calendar'" />
                 </group>
                 <group string="Additional field mapping">
                     <field name="field_mapping_ids" nolabel="1" />

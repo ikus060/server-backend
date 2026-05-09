@@ -45,18 +45,18 @@ class TestDavRadicaleCollection(BaseDavTestCase):
 
     def test_root_and_principal_listing(self):
         root = Collection("")
-        self.assertIn(self.env.user.login, list(root.list()))
+        self.assertIn((self.env.user.login, None), list(root.list_with_records()))
 
         principal = Collection(self.env.user.login)
-        children = list(principal.list())
-        self.assertIn(f"{self.env.user.login}/{self.collection_record.id}", children)
+        children = list(principal.list_with_records())
+        self.assertIn((f"{self.env.user.login}/{self.collection_record.id}", self.collection_record), children)
 
     def test_collection_list_get_and_get_multi(self):
         collection = self.make_collection(self.collection_record)
         href = str(self.partner.id)
 
-        listed = list(collection.list())
-        self.assertIn(href, listed)
+        listed = list(collection.list_with_records())
+        self.assertIn((href, None), listed)
 
         item = collection.get(href)
         self.assertTrue(item)
@@ -88,6 +88,7 @@ class TestDavRadicaleCollection(BaseDavTestCase):
             {
                 "tag": "VADDRESSBOOK",
                 "D:displayname": self.collection_record.display_name,
+                "A:addressbook-description": "",
             },
         )
         self.assertEqual(collection.get_meta("tag"), "VADDRESSBOOK")
@@ -150,8 +151,8 @@ class TestDavRadicaleCollection(BaseDavTestCase):
         with (
             mock.patch.object(
                 collection,
-                "list",
-                return_value=["1", "2", "3"],
+                "list_with_records",
+                return_value=[("1", None), ("2", None),("3", None)],
             ),
             mock.patch.object(
                 collection,

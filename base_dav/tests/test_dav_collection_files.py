@@ -41,10 +41,10 @@ class TestDavCollectionFiles(BaseDavTestCase):
         """Verify files collection root lists record folders."""
         collection = self.make_collection(self.files_collection)
 
-        hrefs = list(collection.list())
+        hrefs = list(collection.list_with_records())
 
         self.assertEqual(len(hrefs), 1)
-        self.assertEqual(hrefs[0], self._folder_href())
+        self.assertEqual(hrefs[0][0], self._folder_href())
 
     def test_dav_list_returns_attachments_in_folder(self):
         """Verify files collection lists attachments inside record folder."""

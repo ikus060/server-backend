@@ -164,12 +164,12 @@ class BaseDavTestCase(TransactionCase):
             domain=domain,
             rights=rights,
         )
-        login_mapping = cls.add_mapping(
+        email_mapping = cls.add_mapping(
             collection,
-            name="login",
-            field_xmlid="base.field_res_users__login",
+            name="email",
+            field_xmlid="base.field_res_users__email",
             import_code="result = item.value",
-            export_code="result = record.login",
+            export_code="result = record.email",
         )
         name_mapping = cls.add_mapping(
             collection,
@@ -182,7 +182,7 @@ class BaseDavTestCase(TransactionCase):
             record=record,
             collection=collection,
             mappings={
-                "login": login_mapping,
+                "email": email_mapping,
                 "name": name_mapping,
             },
         )
@@ -238,7 +238,7 @@ class BaseDavTestCase(TransactionCase):
 
     def make_collection(self, collection, *, login=None):
         login = login or self.env.user.login
-        return Collection(f"{login}/{collection.id}")
+        return Collection(f"{login}/{collection.id}", record=collection)
 
     @staticmethod
     def dav_quote(value):

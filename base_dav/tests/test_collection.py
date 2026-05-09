@@ -22,7 +22,7 @@ class TestCalendar(BaseDavTestCase):
         )
         cls.collection = fixture.collection
         cls.record = fixture.record
-        cls.map_login = fixture.mappings["login"]
+        cls.map_email = fixture.mappings["email"]
         cls.map_name = fixture.mappings["name"]
 
     def setUp(self):
@@ -30,17 +30,14 @@ class TestCalendar(BaseDavTestCase):
         super().setUp()
         self.push_request_context()
 
-    def _compare_record(self, vobj, rec=None):
-        """Assert that imported vobject values match the expected record."""
-        imported_vals = self.collection.from_vobject(vobj)
-        expected_record = rec or self.record
-        self.assertEqual(expected_record.login, imported_vals["login"])
-        self.assertEqual(expected_record.name, imported_vals["name"])
-
     def test_import_export(self):
         """Verify export followed by import preserves record values."""
+        email_orig = self.record.email
+        name_orig = self.record.name
         vobj = self.collection.to_vobject(self.record)
-        self._compare_record(vobj)
+        result = self.collection.from_vobject(vobj, self.record)
+        self.assertEqual(result.email,email_orig)
+        self.assertEqual(result.name, name_orig)
 
     def test_get_record(self):
         """Verify record lookup by ID and by custom UUID field."""
@@ -75,7 +72,7 @@ class TestCalendar(BaseDavTestCase):
 
         self.collection.dav_type = "files"
         self.assertIsNone(self.collection.to_vobject(self.record))
-        self.assertIsNone(self.collection.from_vobject(mock.Mock(name="whatever")))
+        self.assertIsNone(self.collection.from_vobject(mock.Mock(name="whatever"), None))
         self.assertIsNone(self.collection.dav_upload(mock.Mock(), "/x", mock.Mock()))
         self.assertIsNone(self.collection.dav_delete(mock.Mock(), "/x"))
 
@@ -137,19 +134,19 @@ class TestCalendar(BaseDavTestCase):
         bogus = mock.Mock()
         bogus.name = "VCARD"
         self.collection.dav_type = "calendar"
-        self.assertIsNone(self.collection.from_vobject(bogus))
+        self.assertIsNone(self.collection.from_vobject(bogus, None))
 
         bogus.name = "VCALENDAR"
         if hasattr(bogus, "vevent"):
             del bogus.vevent
-        self.assertIsNone(self.collection.from_vobject(bogus))
+        self.assertIsNone(self.collection.from_vobject(bogus, None))
 
         self.collection.dav_type = "addressbook"
         bogus.name = "VCALENDAR"
-        self.assertIsNone(self.collection.from_vobject(bogus))
+        self.assertIsNone(self.collection.from_vobject(bogus, None))
 
         self.collection.dav_type = "files"
-        self.assertIsNone(self.collection.from_vobject(bogus))
+        self.assertIsNone(self.collection.from_vobject(bogus, None))
         self.assertIsNone(self.collection.to_vobject(self.record))
 
     def test_domain_validation_and_access_error_on_upload_outside_domain(self):

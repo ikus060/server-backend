@@ -4,11 +4,11 @@
 
 import posixpath
 import time
+from hashlib import blake2b
 from operator import itemgetter
 from urllib.parse import quote_plus, unquote_plus
 
 import vobject
-
 from odoo import api, fields, models
 from odoo.exceptions import AccessError
 from odoo.osv import expression
@@ -47,6 +47,7 @@ class DavCollection(models.Model):
         [
             ("calendar", "Calendar"),
             ("addressbook", "Addressbook"),
+            # TODO Add VTODO.
             ("files", "Files"),
         ],
         string="Type",
@@ -65,10 +66,24 @@ class DavCollection(models.Model):
         ondelete="cascade",
     )
     domain = fields.Char(
+        string="Domain Filter",
         required=True,
         default="[]",
+        help=(
+            "Odoo domain to filter records. "
+            "Use ${user.id} or ${user.login} as placeholders for the current user."
+        ),
     )
-    field_uuid = fields.Many2one("ir.model.fields")
+    field_uuid = fields.Many2one(
+        "ir.model.fields",
+        string="UID Field",
+        help=(
+            "Select the field to be used as the unique identifier (UID) "
+            "for CalDAV/CardDAV synchronization mapping. "
+            "This field must contain a unique value per record "
+            "to ensure proper synchronization."
+        ),
+    )
     field_mapping_ids = fields.One2many(
         "dav.collection.field_mapping",
         "collection_id",
@@ -76,6 +91,17 @@ class DavCollection(models.Model):
     )
     url = fields.Char(compute="_compute_url")
     calendar_color = fields.Char(default="#48c9f4")
+    description = fields.Text(string="Description")
+    mapper_mode = fields.Selection(
+        string="Mapping Mode",
+        selection="_selection_mapper_mode",
+        required=True,
+        default="custom",
+        help=(
+            "Custom: Use field mappings defined manually.\n"
+            "Built-in: Use predefined mapper for known models (res.partner, calendar.event).\n"
+        ),
+    )
 
     @api.depends("dav_type")
     def _compute_tag(self):
@@ -93,6 +119,78 @@ class DavCollection(models.Model):
                 rec.tag = "VADDRESSBOOK"
             else:
                 rec.tag = False
+
+    def _selection_mapper_mode(self):
+        """
+        Build mapper mode choices dynamically from the registered mapper registry.
+        Always includes 'custom'. Adds 'builtin' only when at least one
+        built-in mapper is registered for the current dav_type.
+        """
+        # Default for backward compatibility.
+        selections = [("custom", "Custom")]
+        # Lookup for dav.mixin subclass.
+        for model_name, model in self.env.registry.models.items():
+            if (
+                issubclass(model, self.env.registry["dav.mixin"])
+                and model is not self.env.registry["dav.mixin"]
+            ):
+                selections.append((model_name, self.env[model_name]._description))
+        return selections
+
+    def _get_mapper(self):
+        # Return the proper class to run the mapping.
+        if self.mapper_mode and self.mapper_mode != "custom":
+            try:
+                return self.env[self.mapper_mode]
+            except KeyError:
+                # In case the module was uninstalled.
+                pass
+        # Fallback to dav mixin.
+        return self.env["dav.mixin"]
+
+    def _apply_mapper_defaults(self, vals):
+        """Apply mapper defaults to vals dict, used in create/write."""
+        mapper_mode = vals.get("mapper_mode")
+        if not mapper_mode or mapper_mode == "custom":
+            return vals
+        # Get the model
+        try:
+            model = self.env[mapper_mode]
+        except KeyError:
+            # In case module was uninstalled.
+            return vals
+
+        # Get the model
+        model_id = self.env["ir.model"].search([("model", "=", mapper_mode)], limit=1)
+        if not model_id:
+            return vals
+        vals["model_id"] = model_id.id
+
+        # Get dav type from Model
+        if getattr(model, "_dav_type", False):
+            vals["dav_type"] = model._dav_type
+
+        # Get UID field from Model
+        if getattr(model, "_dav_field_uuid", False):
+            field = self.env["ir.model.fields"].search(
+                [
+                    ("model_id", "=", model_id.id),
+                    ("name", "=", model._dav_field_uuid),
+                ],
+                limit=1,
+            )
+            vals["field_uuid"] = field.id if field else False
+
+        return vals
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        vals_list = [self._apply_mapper_defaults(vals) for vals in vals_list]
+        return super().create(vals_list)
+
+    def write(self, vals):
+        vals = self._apply_mapper_defaults(vals)
+        return super().write(vals)
 
     def _compute_url(self):
         """Compute absolute DAV access URL for the collection.
@@ -133,14 +231,21 @@ class DavCollection(models.Model):
         }
 
     def _eval_domain(self):
-        """Evaluate stored domain expression into Odoo domain list.
+        """Evaluate stored domain expression, merged with mapper default domain.
 
         :raises ValueError: If domain string is invalid
         :return: Evaluated domain
         :rtype: List[Any]
         """
         self.ensure_one()
-        return safe_eval(self.domain or "[]", self._eval_context())
+        user_domain = list(safe_eval(self.domain or "[]", self._eval_context()))
+
+        mapper = self._get_mapper()
+        default_domain_str = getattr(mapper, "_dav_default_domain", None)
+        if default_domain_str:
+            return expression.AND([user_domain, default_domain_str])
+
+        return user_domain
 
     def eval_domain_records(self):
         """Search records matching the evaluated domain.
@@ -189,109 +294,41 @@ class DavCollection(models.Model):
         )
         return collection_model.search(domain, limit=1)
 
+    def _get_uid_field_name(self):
+        """Return the Odoo field name used as the DAV UID for this collection.
+
+        Uses ``field_uuid`` when configured, otherwise falls back to ``id``.
+
+        :rtype: str
+        """
+        self.ensure_one()
+        if self.field_uuid:
+            return self.field_uuid.name
+        return "id"
+
     def _get_record_uid_value(self, record):
         """Return the DAV item identifier for a record.
 
         Uses ``field_uuid`` when configured, otherwise falls back to ``record.id``.
         The returned value matches the identifier format expected by
         :meth:`get_record`.
+
+        :param record: Odoo record
         """
         self.ensure_one()
 
-        field_uuid = self.sudo().field_uuid
-        if not field_uuid:
-            return str(record.id)
+        field_name = self._get_uid_field_name()
+        value = record[field_name]
 
-        value = record[field_uuid.name]
-        if field_uuid.ttype == "many2one":
+        if self.field_uuid and self.field_uuid.ttype == "many2one":
             return str(value.id) if value else ""
         return str(value)
 
-    def from_vobject(self, item):
-        """Convert vobject item into Odoo field values.
-
-        Supports:
-          - VEVENT for calendar
-          - VCARD for addressbook
-
-        :param item: vobject instance
-        :type item: Any
-
-        :return: Dictionary of field values or None if unsupported
-        :rtype: Optional[Dict[str, Any]]
-        """
-        self.ensure_one()
-
-        if self.dav_type == "calendar":
-            if item.name != "VCALENDAR" or not hasattr(item, "vevent"):
-                return None
-            item = item.vevent
-        elif self.dav_type == "addressbook":
-            if item.name != "VCARD":
-                return None
-        else:
-            return None
-
-        result = {}
-        children = {c.name.lower(): c for c in item.getChildren()}
-        for mapping in self.field_mapping_ids:
-            field_id = mapping.sudo().field_id
-            child = children.get(mapping.name.lower())
-            if not child:
-                continue
-            value = mapping.from_vobject(child)
-            if value is not None:
-                result[field_id.name] = value
-        return result
+    def from_vobject(self, item, record):
+        return self._get_mapper().from_vobject(item, record, self)
 
     def to_vobject(self, record):
-        """Convert Odoo record into vobject representation.
-
-        Automatically adds:
-          - UID if missing
-          - REV based on write_date
-
-        :param record: Odoo record
-        :type record: odoo.models.BaseModel
-
-        :return: vobject instance or None for unsupported types
-        :rtype: Optional[Any]
-        """
-        self.ensure_one()
-
-        if self.dav_type == "calendar":
-            result = vobject.iCalendar()
-            vobj = result.add("vevent")
-        elif self.dav_type == "addressbook":
-            result = vobject.vCard()
-            vobj = result
-        else:
-            return None
-
-        for mapping in self.field_mapping_ids:
-            value = mapping.to_vobject(record)
-            if value is None or value is False:
-                continue
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, (int | float)):
-                value = str(value)
-            vobj.add(mapping.name).value = value
-
-        if "uid" not in vobj.contents:
-            vobj.add("uid").value = self._get_record_uid_value(record)
-
-        if (
-            "rev" not in vobj.contents
-            and "write_date" in record._fields
-            and record.write_date
-        ):
-            s = fields.Datetime.to_string(record.write_date)  # YYYY-MM-DD HH:MM:SS
-            vobj.add("rev").value = (
-                s.replace("-", "").replace(" ", "T").replace(":", "") + "Z"
-            )
-
-        return result
+        return self._get_mapper().to_vobject(record, self)
 
     @api.model
     def _odoo_to_http_datetime(self, value):
@@ -327,6 +364,31 @@ class DavCollection(models.Model):
             for part in posixpath.normpath(f"/{path or ''}").strip("/").split("/")
             if part
         ]
+
+    def dav_etag(self) -> str:
+        """
+        Return a ETAG for to represent this collection.
+        """
+        self.ensure_one()
+
+        # Use blake2b, because it's fast.
+        h = blake2b(digest_size=16)
+
+        # Compute hash using id + write_date for all record- including the collection it self.
+        h.update(bytes(self.id))
+        h.update(str(self.write_date).encode())
+
+        collection_model = self.env[self.model_id.model]
+        rows = collection_model.search_read(
+            self._eval_domain(),
+            fields=["id", "write_date"],
+            order="id asc",  # stable ordering
+        )
+        for row in rows:
+            h.update(bytes(row["id"]))
+            h.update(str(row["write_date"]).encode())
+
+        return '"%s"' % h.hexdigest()
 
     def dav_list(
         self,
@@ -411,8 +473,11 @@ class DavCollection(models.Model):
 
         components = self._split_path(href)
         rec = self.get_record(components)
-        if rec:
-            rec.unlink()
+        if not rec:
+            return
+
+        # Prefer soft-delete (archive) if the model supports it
+        rec.with_context(archive_on_error=True, dav_delete=True).unlink()
 
     def dav_upload(self, collection, href, item):
         """Create or update DAV resource from uploaded vobject.
@@ -434,33 +499,19 @@ class DavCollection(models.Model):
             return None
 
         components = self._split_path(href)
-        model_name = self.sudo().model_id.model
-        collection_model = self.env[model_name]
 
-        data = self.from_vobject(item)
-        if not data:
-            return None
+        # Get corresponding mapper.
+        mapper = self._get_mapper()
 
-        rec = self.get_record(components)
-        if not rec:
-            field_uuid = self.sudo().field_uuid
-            if field_uuid:
-                clean_key = _dav_strip_item_extension(
-                    components[-1] if components else ""
-                )
-                if field_uuid.ttype in ("integer", "many2one"):
-                    try:
-                        clean_key = int(clean_key)
-                    except (TypeError, ValueError):
-                        clean_key = None
-                if clean_key is not None and field_uuid.name not in data:
-                    data[field_uuid.name] = clean_key
+        # TODO We should let the mapper customize the domain here.
+        record = self.get_record(components)
 
-            rec = collection_model.create(data)
-        else:
-            rec.write(data)
+        # Create or update record from vobject.
+        record = mapper.from_vobject(item, record=record, collection=self)
 
-        domain = expression.AND([self._eval_domain(), [("id", "=", rec.id)]])
+        # Before returning this record, check if part of the domain.
+        collection_model = self.env[self.model_id.model]
+        domain = expression.AND([self._eval_domain(), [("id", "=", record.id)]])
         if not collection_model.search(domain, limit=1):
             raise AccessError(self.env._("Record is outside of DAV collection domain"))
 
@@ -468,9 +519,9 @@ class DavCollection(models.Model):
 
         return DavItem(
             collection,
-            item=self.to_vobject(rec),
+            item=mapper.to_vobject(record, self),
             href=href,
-            last_modified=self._odoo_to_http_datetime(rec.write_date),
+            last_modified=self._odoo_to_http_datetime(record.write_date),
         )
 
     def dav_get(self, collection, href):
@@ -532,6 +583,7 @@ class DavCollection(models.Model):
                     collection,
                     href,
                     attachment,
+                    # TODO I think _odoo_to_http_datetime should be moved to Item class.
                     last_modified=self._odoo_to_http_datetime(record.write_date),
                 )
 
@@ -542,9 +594,11 @@ class DavCollection(models.Model):
 
         from ..radicale.collection import Item as DavItem
 
+        mapper = self._get_mapper()
+
         return DavItem(
             collection,
-            item=self.to_vobject(record),
+            item=mapper.to_vobject(record, self),
             href=href,
             last_modified=self._odoo_to_http_datetime(record.write_date),
         )
